@@ -1,0 +1,39 @@
+# Everything the build does not need, and everything it must never be given.
+#
+# The build context is the repository root — the Dockerfile copies each module's pom before its
+# sources so a code change does not re-resolve dependencies. Without this file, `.env`, the mTLS
+# private keys and every previously built jar are uploaded to the daemon on every build: slower,
+# and a secret one layer away from being baked into an image.
+
+# Secrets. Never in an image.
+.env
+.env.*
+!.env.example
+deploy/tls/
+**/*.key
+**/*.pem
+**/*.p12
+**/*.jks
+
+# Build output. Rebuilt inside the image; copying it in invites a stale jar.
+target/
+**/target/
+
+# Version control and editors.
+.git/
+.gitignore
+.github/
+.idea/
+*.iml
+.vscode/
+
+# Documentation and samples. Nothing in the image reads them.
+README.md
+docs/
+*.pdf
+*.md
+!contracts/**/*.md
+
+# Local scratch.
+*.log
+scripts/

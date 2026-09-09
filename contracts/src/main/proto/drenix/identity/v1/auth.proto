@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package drenix.identity.v1;
+
+import "google/protobuf/timestamp.proto";
+import "drenix/identity/v1/user.proto";
+
+option java_package = "uz.drenix.identity.grpc.v1";
+option java_multiple_files = true;
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+  string client_ip = 3;
+  string user_agent = 4;
+  string device_id = 5;   // optional, binds the refresh family to one device
+}
+
+message TokenPair {
+  string access_token = 1;                        // JWT, EdDSA signed, short lived
+  string refresh_token = 2;                       // opaque, 256-bit, rotated on every use
+  google.protobuf.Timestamp access_expires_at = 3;
+  google.protobuf.Timestamp refresh_expires_at = 4;
+  string session_id = 5;
+}
+
+message LoginResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_SUCCESS = 1;
+    OUTCOME_INVALID_CREDENTIALS = 2;
+    OUTCOME_LOCKED = 3;
+    OUTCOME_DISABLED = 4;
+    OUTCOME_RATE_LIMITED = 5;
+    // Credentials were right but the password must be changed first. The token
+    // pair carries a single permission: auth:password:change.
+    OUTCOME_PASSWORD_CHANGE_REQUIRED = 6;
+  }
+  Outcome outcome = 1;
+  TokenPair tokens = 2;
+  User user = 3;
+  google.protobuf.Timestamp retry_after = 4;
+}
+
+message RefreshRequest {
+  string refresh_token = 1;
+  string client_ip = 2;
+  string user_agent = 3;
+}
+
+message RefreshResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_SUCCESS = 1;
+    OUTCOME_INVALID = 2;
+    // The token was already rotated. Treated as theft: the whole family dies.
+    OUTCOME_REUSE_DETECTED = 3;
+  }
+  Outcome outcome = 1;
+  TokenPair tokens = 2;
+}
+
+message LogoutRequest {
+  string session_id = 1;
+  bool all_sessions = 2;   // sign the user out everywhere
+  string user_id = 3;
+}
+
+message IntrospectRequest { string access_token = 1; }
+
+message IntrospectResponse {
+  bool active = 1;
+  string user_id = 2;
+  string username = 3;
+  string session_id = 4;
+  repeated string permissions = 5;
+  repeated RoleAssignment roles = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+message AuthEmpty {}
+
+// ---------------------------------------------------------------------------
+// Session administration
+// ---------------------------------------------------------------------------
+
+message SessionInfo {
+  string session_id = 1;
+  string client_ip = 2;
+  string user_agent = 3;
+  google.protobuf.Timestamp opened_at = 4;
+  // True for the session the calling token belongs to, so a UI can label it
+  // "this device" and warn before an administrator signs themselves out.
+  bool current = 5;
+}
+
+message ListSessionsRequest { string user_id = 1; }
+
+message ListSessionsResponse { repeated SessionInfo sessions = 1; }
+
+// Ends sessions and denylists the access tokens they issued, so revocation
+// takes effect now rather than when the tokens would have expired anyway.
+message RevokeSessionsRequest {
+  string user_id = 1;
+  // One session, or every session the user has when empty.
+  string session_id = 2;
+}
+
+service AuthService {
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc Refresh(RefreshRequest) returns (RefreshResponse);
+  rpc Logout(LogoutRequest) returns (AuthEmpty);
+
+  // Administration of somebody else's sessions. Guarded by session:revoke,
+  // unlike Logout, which acts on the caller's own session.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc RevokeSessions(RevokeSessionsRequest) returns (AuthEmpty);
+  // Used by services that cannot verify the JWT locally. The gateway verifies
+  // signatures itself against JWKS and only calls this for the denylist check.
+  rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
+}

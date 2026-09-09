@@ -1,0 +1,175 @@
+# Build and verify here; deploy on the server through Dokploy.
+#
+# NOTE: this repository is not under git yet. Nothing here runs until you have done `git init`,
+# committed, and pushed to GitHub — docs/DEPLOYMENT.md, section "CI/CD".
+#
+#   push to main ──> build + verify ──> trigger the Dokploy webhook ──> wait for /api/health
+#                          │                        │
+#                          │ fails: the webhook     │ Dokploy builds, then swaps the containers
+#                          │ is never called and    │ and rolls back itself if the build fails
+#                          │ production is untouched
+#
+# Why a webhook and not SSH: Dokploy owns the deployment. It clones the repository, builds the
+# images, replaces the containers and keeps the previous ones. Reaching past it over SSH to run
+# scripts/deploy.sh would give the server two deployment mechanisms that disagree about what is
+# running. The one thing Dokploy will not do on its own is refuse to deploy code that does not
+# compile — which is exactly what this workflow adds in front of it.
+#
+# Turn OFF Dokploy's own "Auto Deploy" on the application, or it will deploy on every push
+# regardless of whether the build passed, and this workflow becomes decoration.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # One deployment at a time. A second push waits rather than racing the first;
+  # `cancel-in-progress: false` because cancelling mid-deployment leaves the server worse off
+  # than letting it finish and superseding it.
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 26
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      # The full reactor. `verify` runs the tests as well as compiling — there are none in this
+      # repository yet, and this is the job that starts failing usefully the day there are.
+      - name: Build
+        run: mvn -B -ntp verify
+
+      # The file Dokploy actually deploys. A malformed one surfaces on the server as an
+      # application that will not start, which is a slow and confusing way to learn about a typo.
+      - name: Validate the Dokploy compose file
+        run: |
+          cat > .env <<'EOF'
+          IDENTITY_DB_PASSWORD=ci
+          NOTIFICATION_DB_PASSWORD=ci
+          PERFORMANCE_DB_PASSWORD=ci
+          REDIS_PASSWORD=ci
+          BOOTSTRAP_ADMIN_PASSWORD=ci-placeholder-12
+          AUTH_SIGNING_KEY={}
+          ALLOWED_ORIGINS=https://performance.drenix.uz
+          EOF
+          # dokploy-network is created by Dokploy on the server and is external here.
+          docker network create dokploy-network >/dev/null
+          docker compose --env-file .env -f deploy/docker-compose.dokploy.yml config >/dev/null
+          # And the host-nginx path, which is the documented fallback if Dokploy is ever dropped.
+          docker compose --env-file .env \
+            -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml config >/dev/null
+          rm -f .env
+
+      # Only used if the deployment ever moves off Dokploy to host nginx. Ten seconds to keep the
+      # fallback from rotting.
+      - name: Validate the nginx configuration
+        run: |
+          docker run --rm \
+            -v "$PWD/deploy/nginx/drenix-limits.conf:/etc/nginx/conf.d/drenix-limits.conf:ro" \
+            -v "$PWD/deploy/nginx/security-headers.conf:/etc/nginx/snippets/drenix-security-headers.conf:ro" \
+            -v "$PWD/deploy/nginx/performance.drenix.uz.conf:/etc/nginx/conf.d/site.conf:ro" \
+            --entrypoint sh nginx:1.27-alpine -c '
+              apk add --no-cache openssl >/dev/null
+              D=/etc/letsencrypt/live/performance.drenix.uz
+              mkdir -p $D /var/www/certbot /etc/nginx/snippets
+              openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+                -keyout $D/privkey.pem -out $D/fullchain.pem \
+                -subj "/CN=performance.drenix.uz" 2>/dev/null
+              cp $D/fullchain.pem $D/chain.pem
+              rm -f /etc/nginx/conf.d/default.conf
+              nginx -t'
+
+      - name: Check the deployment scripts parse
+        run: bash -n scripts/deploy.sh scripts/rollback.sh scripts/backup-db.sh
+
+      # Insurance against the one mistake a later commit cannot undo: a secret that reaches a
+      # remote is public from that moment and has to be rotated, not deleted.
+      - name: Refuse a committed secret
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked by git. Remove it and ROTATE every credential in it."
+            exit 1
+          fi
+          if git ls-files | grep -qE '^deploy/tls/.*\.key$'; then
+            echo "::error::private keys are tracked by git. Remove them and regenerate."
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy via Dokploy
+    needs: build
+    # main only, and never from a pull request — a fork's PR must not reach production.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://performance.drenix.uz
+    steps:
+      # The whole URL is the secret, token included. Dokploy shows it on the application under
+      # Deployments; keeping the entire URL in one secret means this step does not care whether
+      # the path is /api/deploy/<token> or something else in a later Dokploy version.
+      - name: Trigger the Dokploy deployment
+        run: |
+          code=$(curl -sS -o /tmp/body -w '%{http_code}' -X POST \
+                   --max-time 30 "${{ secrets.DOKPLOY_WEBHOOK_URL }}")
+          echo "Dokploy answered $code"
+          head -c 500 /tmp/body || true
+          echo
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::Dokploy did not accept the deployment request."
+            exit 1
+          fi
+
+      # Dokploy builds asynchronously — the webhook returns before anything has been replaced.
+      # The build takes minutes: five Java modules from source.
+      - name: Wait for the deployment to land
+        run: sleep 120
+
+      - name: Verify the public endpoint
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 10 https://performance.drenix.uz/api/health | grep -q '"UP"'; then
+              echo "public health check passed"
+              exit 0
+            fi
+            echo "attempt $i: not answering yet"
+            sleep 20
+          done
+          echo "::error::https://performance.drenix.uz/api/health never answered."
+          echo "::error::Read the deployment log in Dokploy — it holds the build output."
+          exit 1
+
+      # WHAT THIS DOES AND DOES NOT PROVE.
+      #
+      # It proves the API is reachable and alive through DNS, Traefik and TLS. It does NOT prove
+      # the running containers are built from this commit: /api/health deliberately reveals no
+      # version, so a check that passes against the previous release looks identical.
+      #
+      # Dokploy's own deployment log is the authority on which commit is live. If you want CI to
+      # assert it instead, /api/health can carry a short build identifier — one field and one
+      # environment variable — and this step can compare it against github.sha. Ask and I will
+      # add it; it was left out because this endpoint is the one thing on the internet that
+      # answers without a token, so everything it says is said to everybody.
+      - name: Where to look if this failed
+        if: failure()
+        run: |
+          echo "1. Dokploy -> the application -> Deployments -> the newest log."
+          echo "2. Dokploy -> Logs, per service. edge-gateway first, then user-service."
+          echo "3. A Flyway migration that fails stops its service from starting; the log says so."
+          echo "4. Traefik: a 404 on /api usually means Strip Path is ON. It must be OFF."

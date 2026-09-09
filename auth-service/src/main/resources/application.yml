@@ -1,0 +1,75 @@
+spring:
+  application:
+    name: auth-service
+  threads:
+    virtual:
+      enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+      timeout: 2s
+  ssl:
+    bundle:
+      pem:
+        internal:
+          keystore:
+            certificate: file:${TLS_CERT_PATH:/etc/drenix/tls/auth-service.crt}
+            private-key: file:${TLS_KEY_PATH:/etc/drenix/tls/auth-service.key}
+          truststore:
+            certificate: file:${TLS_CA_PATH:/etc/drenix/tls/internal-ca.crt}
+
+# Serves the JWKS document and the actuator, on the internal network only.
+#
+# TLS is on because the JWKS document decides which signatures are valid: anyone able to
+# substitute it can mint tokens. Clients verify this certificate against the internal CA and
+# nothing else. No client certificate is required here — the document is public key material,
+# and the services that read it do so before any call of their own.
+server:
+  port: ${JWKS_PORT:9443}
+  ssl:
+    enabled: ${JWKS_TLS_ENABLED:true}
+    bundle: internal
+
+drenix:
+  grpc:
+    port: ${GRPC_PORT:9092}
+    tls-enabled: ${GRPC_TLS_ENABLED:true}
+    certificate: ${TLS_CERT_PATH:/etc/drenix/tls/auth-service.crt}
+    private-key: ${TLS_KEY_PATH:/etc/drenix/tls/auth-service.key}
+    ca: ${TLS_CA_PATH:/etc/drenix/tls/internal-ca.crt}
+    allowed-peers: edge-gateway
+  auth:
+    issuer: ${TOKEN_ISSUER:https://auth.drenix.uz}
+    audience: ${TOKEN_AUDIENCE:drenix-internal}
+    access-token-ttl: PT10M
+    refresh-token-ttl: P14D
+    signing-key: ${AUTH_SIGNING_KEY:}       # Ed25519 JWK JSON; empty means an ephemeral dev key
+    previous-keys: ${AUTH_PREVIOUS_KEYS:}   # one retired JWK per line, kept for verification
+    rate-limit:
+      per-username: 10
+      per-ip: 30
+      window: PT5M
+  tls:
+    certificate: ${TLS_CERT_PATH:/etc/drenix/tls/auth-service.crt}
+    private-key: ${TLS_KEY_PATH:/etc/drenix/tls/auth-service.key}
+    ca: ${TLS_CA_PATH:/etc/drenix/tls/internal-ca.crt}
+  clients:
+    user-service:
+      host: ${USER_SERVICE_HOST:user-service}
+      port: ${USER_SERVICE_PORT:9090}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    root: INFO
+    uz.drenix: DEBUG

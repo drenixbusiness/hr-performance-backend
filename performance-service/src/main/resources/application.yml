@@ -1,0 +1,157 @@
+spring:
+  application:
+    name: performance-service
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/drenix_performance}
+    username: ${DB_USER:performance_app}
+    password: ${DB_PASSWORD:}
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema. `validate` turns a forgotten migration into a startup failure
+      # rather than into a column that silently is not there.
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+# HTTP here serves the actuator only. The API is gRPC.
+server:
+  port: 9095
+  address: 127.0.0.1
+
+drenix:
+  grpc:
+    port: ${GRPC_PORT:9094}
+    tls-enabled: ${GRPC_TLS_ENABLED:true}
+    certificate: ${TLS_CERT_PATH:/etc/drenix/tls/performance-service.crt}
+    private-key: ${TLS_KEY_PATH:/etc/drenix/tls/performance-service.key}
+    ca: ${TLS_CA_PATH:/etc/drenix/tls/internal-ca.crt}
+    allowed-peers: ${GRPC_ALLOWED_PEERS:edge-gateway,notification-service}
+    jwks-uri: ${JWKS_URI:https://auth-service:9443/.well-known/jwks.json}
+    issuer: ${TOKEN_ISSUER:https://auth.drenix.uz}
+    audience: ${TOKEN_AUDIENCE:drenix-internal}
+
+  monday:
+    # A personal API token. It reads the whole account, so it belongs in a secret manager
+    # rather than in a file — see .env for local development.
+    token: ${MONDAY_TOKEN:}
+
+    # One board per company. JM and BP hire independently and a recruiter appears on exactly
+    # one board, so this is two boards rather than one board with a company column.
+    boards:
+      JM: ${MONDAY_BOARD_ID_JM:${MONDAY_BOARD_ID:0}}
+      BP: ${MONDAY_BOARD_ID_BP:0}
+
+    # Per-company token overrides. Empty: one token reads both boards today.
+    tokens:
+      JM: ${MONDAY_TOKEN_JM:}
+      BP: ${MONDAY_TOKEN_BP:}
+
+    # Column ids are per board, not per account. BP was copied from JM, so Source and Date
+    # kept their ids — but the termination column did not, and a column id that is not on a
+    # board reads as empty rather than as an error. Getting this wrong would show every BP
+    # driver as never terminated.
+    columns:
+      BP:
+        termination-date-column-id: ${MONDAY_TERMINATION_COLUMN_BP:date_mm5znbd9}
+
+    # Groups are matched by title, case-insensitively. Everything outside these two — Rejected,
+    # Notifications, the priority buckets — is candidates and noise, not drivers.
+    active-group: ${MONDAY_ACTIVE_GROUP:Loaded}
+    terminated-group: ${MONDAY_TERMINATED_GROUP:Terminated}
+
+    # Column ids, not titles: renaming a column in monday leaves its id alone, so titles would
+    # break the chart the moment somebody tidied the board.
+    source-column-id: ${MONDAY_SOURCE_COLUMN:color_mkra3nmw}          # Source — the recruiter
+    hire-date-column-id: ${MONDAY_HIRE_DATE_COLUMN:date_mkrbh5r0}     # Date
+    termination-date-column-id: ${MONDAY_TERMINATION_DATE_COLUMN:date_mm5gztc7}  # Date Terminated
+
+    # What to do with a driver in the terminated group whose leaving date is missing or falls
+    # before their hire date. On the current board that is 29 rows.
+    #
+    #   USE_UPDATED_AT      the row's last-edit time. The only date monday still holds for these
+    #                       rows — but it is when the row was last touched, so a bulk tidy-up
+    #                       stamps them all with the same month. On this board all 29 last changed
+    #                       in July 2026, which puts 29 terminations in that single bar.
+    #   ASSUME_STILL_ACTIVE count the hire, leave them on the active line. Overstates active.
+    #   EXCLUDE_FROM_ACTIVE count the hire, keep them off the active line entirely.
+    unknown-termination: ${MONDAY_UNKNOWN_TERMINATION:USE_UPDATED_AT}
+
+    cache-ttl: ${MONDAY_CACHE_TTL:PT10M}
+
+  ringcentral:
+    # A JWT credential from the RingCentral Developer Console. The app needs ReadCallLog and
+    # ReadMessages; ReadAccounts is not required, though without it extensions can only be
+    # discovered through the call log — see RingCentralClient.
+    # One RingCentral account per company. They are genuinely separate accounts: a number in
+    # one does not exist in the other, the call logs are disjoint, and each has its own
+    # ten-requests-a-minute budget.
+    accounts:
+      JM:
+        client-id: ${RC_CLIENT_ID_JM:${RC_CLIENT_ID:}}
+        client-secret: ${RC_CLIENT_SECRET_JM:${RC_CLIENT_SECRET:}}
+        jwt: ${RC_JWT_JM:${RC_JWT:}}
+      BP:
+        client-id: ${RC_CLIENT_ID_BP:}
+        client-secret: ${RC_CLIENT_SECRET_BP:}
+        jwt: ${RC_JWT_BP:}
+
+    # Whose account to read for somebody whose role grants name no company at all.
+    default-entity: ${RC_DEFAULT_ENTITY:JM}
+
+    # The fallback standard. The real one lives in the identity database and is edited through
+    # PUT /api/v1/activity/standard; these values are only used if a request arrives without one,
+    # which in practice means somebody calling performance-service directly.
+    calls-per-day: ${RC_CALLS_PER_DAY:125}          # every attempt, either direction
+    talk-per-day: ${RC_TALK_PER_DAY:PT1H}          # total time on calls in a shift
+    sms-sent-per-day: ${RC_SMS_PER_DAY:150}        # outbound only
+    shift: ${RC_SHIFT:PT9H}                        # 18:00-03:00; the denominator for part-days
+    shift-start: ${RC_SHIFT_START:18:00}           # the window the daily snapshot records
+    shift-end: ${RC_SHIFT_END:03:00}
+
+    # The zone dates, shift windows and hour labels are expressed in. Must match
+    # notification-service, or a shift window judges hours nobody worked.
+    zone: ${RC_ZONE:UTC}
+
+    cache-ttl: ${RC_CACHE_TTL:PT10M}
+
+    max-range-days: ${RC_MAX_RANGE_DAYS:31}
+
+  # Where the snapshot job reads the directory from. Peer-authenticated: it runs on a schedule
+  # and has no user token to forward.
+  clients:
+    user-service:
+      host: ${USER_SERVICE_HOST:user-service}
+      port: ${USER_SERVICE_PORT:9090}
+
+  # How often each shift is written down, and how soon after startup the first pass runs.
+  snapshot:
+    interval: ${SNAPSHOT_INTERVAL:PT1H}
+    initial-delay: ${SNAPSHOT_INITIAL_DELAY:PT2M}
+
+  # Written feedback. Without a key the endpoint answers 503 and says so; nothing else is
+  # affected, and no request ever leaves the network without one.
+  ai:
+    api-key: ${OPENAI_API_KEY:}
+    base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+    model: ${OPENAI_MODEL:gpt-4o-mini}
+    timeout: ${OPENAI_TIMEOUT:PT180S}
+    max-tokens: ${OPENAI_MAX_TOKENS:6000}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:

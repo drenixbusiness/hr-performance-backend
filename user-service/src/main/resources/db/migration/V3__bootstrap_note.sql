@@ -1,0 +1,14 @@
+-- =====================================================================
+-- No bootstrap user is inserted here on purpose.
+--
+-- A password hash committed to git is a password everyone has. The first
+-- administrator is created at startup by BootstrapAdminInitializer, which
+-- reads DRENIX_BOOTSTRAP_ADMIN_PASSWORD from the environment, hashes it with
+-- Argon2id, and refuses to start if the variable is missing while the users
+-- table is empty.
+--
+-- The account is created with must_change_password = TRUE, so the bootstrap
+-- password survives exactly one login. Every later account is created by an
+-- admin through UserService.CreateUser — there is no registration path.
+-- =====================================================================
+SELECT 1;

@@ -1,0 +1,298 @@
+syntax = "proto3";
+
+package drenix.identity.v1;
+
+import "google/protobuf/timestamp.proto";
+import "drenix/identity/v1/common.proto";
+
+option java_package = "uz.drenix.identity.grpc.v1";
+option java_multiple_files = true;
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+message RoleAssignment {
+  string role_code = 1;
+  Entity entity = 2;   // UNSPECIFIED = the role applies across every entity
+}
+
+message User {
+  string id = 1;                 // UUID v7
+  string username = 2;
+  string full_name = 3;
+  string email = 4;
+  string phone = 5;
+  UserStatus status = 6;
+  bool must_change_password = 7;
+  repeated RoleAssignment roles = 8;
+  repeated string permissions = 9;   // flattened, derived from roles
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  google.protobuf.Timestamp last_login_at = 12;
+  string created_by = 13;
+  // The first RingCentral number, or empty. Kept so that clients written
+  // against the single-number API keep working; ring_central_phones is the
+  // real field and the only one that shows a lead's second extension.
+  string ring_central_phone = 14;
+  // Every RingCentral extension this person's calls and messages are logged
+  // against, in the order an admin entered them. Leads work more than one.
+  repeated string ring_central_phones = 16;
+  // What the monday.com board calls this person, for the recruiting chart.
+  string monday_name = 15;
+  // The day they started, YYYY-MM-DD. Empty when nobody has recorded it, in
+  // which case tenure falls back to their first hire on the board — which can
+  // only ever be later than the truth, never earlier.
+  string employment_start_date = 17;
+}
+
+message CreateUserRequest {
+  string username = 1;
+  string full_name = 2;
+  string email = 3;
+  string phone = 4;
+  // Send ring_central_phones. ring_central_phone is accepted as a
+  // one-element shorthand, and ignored when the repeated field is present.
+  string ring_central_phone = 7;
+  repeated string ring_central_phones = 9;
+  string monday_name = 8;
+  string employment_start_date = 10;   // YYYY-MM-DD, optional
+  // Admin sets the first password. The account is always created with
+  // must_change_password = true, so this value only survives one login.
+  string initial_password = 5;
+  repeated RoleAssignment roles = 6;
+}
+
+message UpdateUserRequest {
+  string id = 1;
+  // Only the fields present in update_mask are written.
+  // full_name | email | phone | status | ring_central_phones | monday_name
+  //   | employment_start_date
+  repeated string update_mask = 2;
+  string full_name = 3;
+  string email = 4;
+  string phone = 5;
+  UserStatus status = 6;
+  // Written under the mask entry ring_central_phones. The singular field is a
+  // one-element shorthand for callers not yet updated; the gateway folds it
+  // into the repeated one before the call is made.
+  string ring_central_phone = 7;
+  repeated string ring_central_phones = 9;
+  string monday_name = 8;
+  // Written under the mask entry employment_start_date. An empty string clears it.
+  string employment_start_date = 10;
+}
+
+message GetUserRequest { string id = 1; }
+message DeleteUserRequest {
+  string id = 1;
+  string reason = 2;   // written to the audit log, required
+}
+
+message ListUsersRequest {
+  PageRequest page = 1;
+  Entity entity = 2;            // optional filter
+  UserStatus status = 3;        // optional filter
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  PageInfo page = 2;
+}
+
+message AssignRolesRequest {
+  string user_id = 1;
+  repeated RoleAssignment roles = 2;   // replaces the whole set
+}
+
+message ResetPasswordRequest {
+  string user_id = 1;
+  string new_password = 2;    // admin-issued, forces must_change_password
+}
+
+message ChangeOwnPasswordRequest {
+  string user_id = 1;
+  string current_password = 2;
+  string new_password = 3;
+}
+
+// Clears failed_attempts and locked_until. Separate from UpdateUser because
+// unlocking is not a profile edit: it undoes a defence the system applied
+// itself, and it is worth its own audit entry and its own permission.
+message UnlockUserRequest { string id = 1; }
+
+message Empty {}
+
+// ---------------------------------------------------------------------------
+// Credential verification — internal, auth-service only
+// ---------------------------------------------------------------------------
+
+// Password hashes never leave user-service. auth-service sends the candidate
+// password over mTLS and receives a verdict, not a hash.
+message VerifyCredentialsRequest {
+  string username = 1;
+  string password = 2;
+  string client_ip = 3;
+  string user_agent = 4;
+}
+
+message VerifyCredentialsResponse {
+  enum Result {
+    RESULT_UNSPECIFIED = 0;
+    RESULT_OK = 1;
+    RESULT_INVALID_CREDENTIALS = 2;   // wrong user OR wrong password, never distinguished
+    RESULT_LOCKED = 3;
+    RESULT_DISABLED = 4;
+  }
+  Result result = 1;
+  User user = 2;                       // populated only when result = OK
+  google.protobuf.Timestamp locked_until = 3;
+  int32 attempts_remaining = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail — read only. The table refuses UPDATE and DELETE at the database
+// level, so there is deliberately no RPC that writes or amends an entry.
+// ---------------------------------------------------------------------------
+
+message AuditEntry {
+  int64 id = 1;
+  google.protobuf.Timestamp occurred_at = 2;
+  string actor_id = 3;             // empty for an actor that no longer exists, or a failed login
+  string actor_username = 4;
+  string action = 5;               // e.g. user.create, auth.login
+  string target_type = 6;          // e.g. user, role
+  string target_id = 7;
+  string outcome = 8;              // SUCCESS | DENIED | FAILURE
+  string client_ip = 9;
+  string user_agent = 10;
+  string correlation_id = 11;      // ties an entry to the request that produced it
+  string detail_json = 12;         // free-form JSON object, passed through as written
+}
+
+message ListAuditRequest {
+  // The cursor is the id of the last entry on the previous page. Ids are assigned
+  // in insertion order and rows are never removed, so paging cannot drift.
+  PageRequest page = 1;
+  string actor_username = 2;       // optional, exact
+  string action = 3;               // optional, exact
+  string outcome = 4;              // optional: SUCCESS | DENIED | FAILURE
+  string target_id = 5;            // optional, exact
+  google.protobuf.Timestamp occurred_from = 6;  // optional, inclusive
+  google.protobuf.Timestamp occurred_to = 7;    // optional, exclusive
+}
+
+message ListAuditResponse {
+  repeated AuditEntry entries = 1;
+  PageInfo page = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Roles and permissions
+// ---------------------------------------------------------------------------
+
+message Role {
+  string code = 1;              // stable identifier, e.g. HR_MANAGER
+  string name = 2;
+  string description = 3;
+  bool system = 4;              // system roles cannot be deleted
+  repeated string permissions = 5;
+  int32 user_count = 6;
+}
+
+message Permission {
+  string code = 1;              // resource:action, e.g. user:create
+  string resource = 2;
+  string action = 3;
+  string description = 4;
+}
+
+message CreateRoleRequest {
+  string code = 1;
+  string name = 2;
+  string description = 3;
+  repeated string permissions = 4;
+}
+
+message UpdateRoleRequest {
+  string code = 1;
+  string name = 2;
+  string description = 3;
+  repeated string permissions = 4;   // replaces the whole set
+}
+
+message DeleteRoleRequest { string code = 1; }
+message GetRoleRequest { string code = 1; }
+message ListRolesResponse { repeated Role roles = 1; }
+message ListPermissionsResponse { repeated Permission permissions = 1; }
+
+// ---------------------------------------------------------------------------
+// Services
+// ---------------------------------------------------------------------------
+
+service UserService {
+  rpc CreateUser(CreateUserRequest) returns (User);
+  rpc GetUser(GetUserRequest) returns (User);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+  rpc UpdateUser(UpdateUserRequest) returns (User);
+  rpc DeleteUser(DeleteUserRequest) returns (Empty);
+  rpc AssignRoles(AssignRolesRequest) returns (User);
+  rpc ResetPassword(ResetPasswordRequest) returns (Empty);
+  rpc ChangeOwnPassword(ChangeOwnPasswordRequest) returns (Empty);
+
+  // Clears a lockout imposed by failed logins, without touching the password.
+  rpc UnlockUser(UnlockUserRequest) returns (User);
+
+  rpc ListAudit(ListAuditRequest) returns (ListAuditResponse);
+
+  // internal
+  rpc VerifyCredentials(VerifyCredentialsRequest) returns (VerifyCredentialsResponse);
+}
+
+service RoleService {
+  rpc CreateRole(CreateRoleRequest) returns (Role);
+  rpc GetRole(GetRoleRequest) returns (Role);
+  rpc ListRoles(Empty) returns (ListRolesResponse);
+  rpc UpdateRole(UpdateRoleRequest) returns (Role);
+  rpc DeleteRole(DeleteRoleRequest) returns (Empty);
+  rpc ListPermissions(Empty) returns (ListPermissionsResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Editable settings.
+//
+// The activity standard used to be configuration, which meant changing a
+// target needed a release. It is a management decision, and management
+// decisions move faster than deployments — so it lives in the database, one
+// row, guarded by its own permission.
+//
+// It sits in user-service rather than performance-service because that is
+// where the database is; performance-service holds no state at all and is
+// handed the standard on each request.
+// ---------------------------------------------------------------------------
+
+message ActivityStandardSettings {
+  int32 calls_per_day = 1;
+  int32 talk_seconds_per_day = 2;
+  int32 sms_sent_per_day = 3;
+  // How long a full shift is. Targets are scaled by window / shift when a
+  // caller asks about part of a day.
+  int32 shift_minutes = 4;
+  string updated_at = 5;         // RFC-3339, empty when never changed
+  string updated_by = 6;         // username, empty when never changed
+}
+
+message UpdateActivityStandardRequest {
+  // A full replacement rather than a patch: four numbers that are read
+  // together and mean nothing apart, and a partial update of a target is a
+  // good way to leave a half-changed standard nobody can explain.
+  int32 calls_per_day = 1;
+  int32 talk_seconds_per_day = 2;
+  int32 sms_sent_per_day = 3;
+  int32 shift_minutes = 4;
+}
+
+service SettingsService {
+  rpc GetActivityStandard(Empty) returns (ActivityStandardSettings);
+  rpc UpdateActivityStandard(UpdateActivityStandardRequest) returns (ActivityStandardSettings);
+}

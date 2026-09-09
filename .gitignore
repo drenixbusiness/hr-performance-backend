@@ -1,0 +1,35 @@
+target/
+*.log
+.idea/
+*.iml
+.mvn/wrapper/maven-wrapper.jar
+
+# ---------------------------------------------------------------------------
+# Secrets. Nothing here may ever be committed.
+#
+# `.env` was already listed; `.env.backup` was not, and its own first line claimed it was — a
+# file full of working credentials, one `git add .` away from being published. The pattern now
+# covers every variant, and `.env.example` is re-included because it holds placeholders only.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# mTLS material for the internal gRPC mesh, generated per environment by
+# scripts/gen-certs.sh. The private keys of a certificate authority.
+deploy/tls/
+!deploy/tls/.gitkeep
+
+# Public TLS. Certbot writes these on the server; they never belong in the repository.
+deploy/letsencrypt/
+*.pem
+*.p12
+*.jks
+
+# Database dumps taken by scripts/backup-db.sh. They contain every user row.
+backups/
+*.sql.gz
+*.dump
+
+# Generated reports. Real names and real figures.
+*.pdf

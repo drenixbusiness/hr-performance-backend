@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>uz.drenix</groupId>
+    <artifactId>drenix-backend</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>contracts</artifactId>
+  <name>Drenix contracts</name>
+  <description>Protobuf definitions and the generated gRPC stubs. The only contract between services.</description>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-protobuf</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-stub</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.google.protobuf</groupId>
+      <artifactId>protobuf-java</artifactId>
+    </dependency>
+    <!--
+      The generated stubs reference javax.annotation.Generated, which is not in the JDK.
+      provided scope: needed to compile the generated code, not needed at runtime.
+    -->
+    <dependency>
+      <groupId>org.apache.tomcat</groupId>
+      <artifactId>annotations-api</artifactId>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <extensions>
+      <!--
+        Detects the OS and CPU and publishes ${os.detected.classifier}, which is how the right
+        protoc binary gets picked (windows-x86_64, linux-x86_64, osx-aarch_64 and so on).
+        protoc is a native executable, not a jar, so there is no portable artifact to fall back on.
+      -->
+      <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>${os-maven-plugin.version}</version>
+      </extension>
+    </extensions>
+
+    <plugins>
+      <plugin>
+        <groupId>org.xolstice.maven.plugins</groupId>
+        <artifactId>protobuf-maven-plugin</artifactId>
+        <version>${protobuf-maven-plugin.version}</version>
+        <configuration>
+          <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+          <pluginId>grpc-java</pluginId>
+          <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+          <checkStaleMillis>10000</checkStaleMillis>
+        </configuration>
+        <executions>
+          <!--
+            Both outputs sit directly under target/generated-sources rather than in the plugin's
+            default target/generated-sources/protobuf/{java,grpc-java}.
+
+            The default nests the package root one level too deep for IDEs: IntelliJ marks every
+            direct child of generated-sources as a source root, so it would mark `protobuf` and
+            then read uz/drenix/... as the package `java.uz.drenix...`. Maven still compiles —
+            the plugin registers the real roots itself — but every `uz.drenix.identity.grpc.v1`
+            import shows as unresolved in the editor. Flattening the layout keeps the IDE and the
+            build looking at the same source roots.
+          -->
+          <execution>
+            <id>protobuf-messages</id>
+            <goals>
+              <goal>compile</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/generated-sources/protobuf-java</outputDirectory>
+            </configuration>
+          </execution>
+          <execution>
+            <id>protobuf-grpc-stubs</id>
+            <goals>
+              <goal>compile-custom</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/generated-sources/protobuf-grpc-java</outputDirectory>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

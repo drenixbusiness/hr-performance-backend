@@ -1,0 +1,77 @@
+spring:
+  application:
+    name: notification-service
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/drenix_notification}
+    username: ${DB_USER:notification_app}
+    password: ${DB_PASSWORD:}
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema. `validate` turns a migration somebody forgot to write into a
+      # startup failure rather than into a column that silently is not there.
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+# HTTP here serves the actuator only. The API is gRPC.
+server:
+  port: 9097
+  address: 127.0.0.1
+
+drenix:
+  grpc:
+    port: ${GRPC_PORT:9096}
+    tls-enabled: ${GRPC_TLS_ENABLED:true}
+    certificate: ${TLS_CERT_PATH:/etc/drenix/tls/notification-service.crt}
+    private-key: ${TLS_KEY_PATH:/etc/drenix/tls/notification-service.key}
+    ca: ${TLS_CA_PATH:/etc/drenix/tls/internal-ca.crt}
+    allowed-peers: edge-gateway
+    jwks-uri: ${JWKS_URI:https://auth-service:9443/.well-known/jwks.json}
+    issuer: ${TOKEN_ISSUER:https://auth.drenix.uz}
+    audience: ${TOKEN_AUDIENCE:drenix-internal}
+
+  clients:
+    user-service:
+      host: ${USER_SERVICE_HOST:user-service}
+      port: ${USER_SERVICE_PORT:9090}
+    performance-service:
+      host: ${PERFORMANCE_SERVICE_HOST:performance-service}
+      port: ${PERFORMANCE_SERVICE_PORT:9094}
+
+  notification:
+    # How often the audit log is read for anything new, and how much of it at a time.
+    audit-interval: ${NOTIFY_AUDIT_INTERVAL:PT60S}
+    audit-initial-delay: ${NOTIFY_AUDIT_DELAY:PT30S}
+    audit-batch: ${NOTIFY_AUDIT_BATCH:200}
+
+    # The performance check runs hourly and skips shifts it has already judged, rather than on a
+    # daily cron that simply does not happen if the service is restarting when it fires.
+    performance-interval: ${NOTIFY_PERFORMANCE_INTERVAL:PT1H}
+    performance-initial-delay: ${NOTIFY_PERFORMANCE_DELAY:PT90S}
+
+    # Must match performance-service: judging 18:00-03:00 in the wrong zone judges hours nobody
+    # worked, and everybody fails.
+    shift-start: ${NOTIFY_SHIFT_START:18:00}
+    shift-end: ${NOTIFY_SHIFT_END:03:00}
+    zone: ${RC_ZONE:Asia/Tashkent}
+
+    # How far back the check will catch up after an outage. Bounded so a service off for a month
+    # does not fill every inbox on the morning it returns.
+    max-catch-up-days: ${NOTIFY_MAX_CATCH_UP_DAYS:3}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true

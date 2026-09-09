@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package drenix.identity.v1;
+
+option java_package = "uz.drenix.identity.grpc.v1";
+option java_multiple_files = true;
+
+// Page cursor is opaque to the caller: an encoded (sort key, id) pair, never an offset.
+// Offsets drift while rows are inserted; cursors do not.
+message PageRequest {
+  int32 limit = 1;          // 1..200, server clamps
+  string cursor = 2;        // empty for the first page
+  string search = 3;        // optional free-text filter
+}
+
+message PageInfo {
+  string next_cursor = 1;   // empty when there is no next page
+  bool has_more = 2;
+}
+
+// Which company the assignment or query applies to.
+// UNSPECIFIED on a role assignment means the assignment is global (every company).
+enum Entity {
+  ENTITY_UNSPECIFIED = 0;
+  ENTITY_JM = 1;      // Joshua Meuzelaar LLC
+  ENTITY_BP = 2;      // Bipolarbear Enterprises
+
+  // Wildfire Express (3) and Kaisen (4) are not operating yet. The numbers and names are
+  // reserved rather than deleted outright, so re-adding them later cannot accidentally reuse
+  // a number for a different company and silently reinterpret grants already in the database.
+  reserved 3, 4;
+  reserved "ENTITY_WF", "ENTITY_KAISEN";
+}
+
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_DISABLED = 2;   // admin switched the account off
+  USER_STATUS_LOCKED = 3;     // too many failed logins, clears after the lock window
+}

@@ -1,0 +1,186 @@
+# Local development topology. Not a production manifest: secrets are inline,
+# TLS certificates come from ./tls, and the databases are not backed up.
+name: drenix-backend
+
+services:
+  postgres-identity:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: drenix_identity
+      POSTGRES_USER: identity_app
+      POSTGRES_PASSWORD: ${IDENTITY_DB_PASSWORD:?set IDENTITY_DB_PASSWORD}
+      # Read by the init script below, which creates the notification database.
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?set NOTIFICATION_DB_PASSWORD}
+      PERFORMANCE_DB_PASSWORD: ${PERFORMANCE_DB_PASSWORD:?set PERFORMANCE_DB_PASSWORD}
+    volumes:
+      - identity-data:/var/lib/postgresql/data
+      # Runs only on a fresh volume. An existing installation needs the same two
+      # statements applied by hand - see the README.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U identity_app -d drenix_identity"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No published port: only the compose network reaches the database.
+    expose: ["5432"]
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      --appendonly yes
+      --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    expose: ["6379"]
+
+  user-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        MODULE: user-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres-identity:5432/drenix_identity
+      DB_USER: identity_app
+      DB_PASSWORD: ${IDENTITY_DB_PASSWORD}
+      JWKS_URI: https://auth-service:9443/.well-known/jwks.json
+      DRENIX_BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?set BOOTSTRAP_ADMIN_PASSWORD}
+      TLS_CERT_PATH: /etc/drenix/tls/user-service.crt
+      TLS_KEY_PATH: /etc/drenix/tls/user-service.key
+      TLS_CA_PATH: /etc/drenix/tls/internal-ca.crt
+    volumes:
+      - ./tls:/etc/drenix/tls:ro
+    depends_on:
+      postgres-identity: { condition: service_healthy }
+    expose: ["9090"]
+
+  auth-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        MODULE: auth-service
+    environment:
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      AUTH_SIGNING_KEY: ${AUTH_SIGNING_KEY:?run scripts/gen-signing-key.sh}
+      USER_SERVICE_HOST: user-service
+      TLS_CERT_PATH: /etc/drenix/tls/auth-service.crt
+      TLS_KEY_PATH: /etc/drenix/tls/auth-service.key
+      TLS_CA_PATH: /etc/drenix/tls/internal-ca.crt
+    volumes:
+      - ./tls:/etc/drenix/tls:ro
+    depends_on:
+      redis: { condition: service_healthy }
+      user-service: { condition: service_started }
+    expose: ["9092", "9443"]
+
+  performance-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        MODULE: performance-service
+    environment:
+      # Reads the recruiting board. The token is a personal API key with account-wide read
+      # access, so it belongs in a secret manager anywhere but a developer's laptop.
+      MONDAY_TOKEN: ${MONDAY_TOKEN:?set MONDAY_TOKEN}
+      MONDAY_BOARD_ID: ${MONDAY_BOARD_ID:?set MONDAY_BOARD_ID}
+      MONDAY_UNKNOWN_TERMINATION: ${MONDAY_UNKNOWN_TERMINATION:-USE_UPDATED_AT}
+      RC_CLIENT_ID: ${RC_CLIENT_ID:?set RC_CLIENT_ID}
+      RC_CLIENT_SECRET: ${RC_CLIENT_SECRET:?set RC_CLIENT_SECRET}
+      RC_JWT: ${RC_JWT:?set RC_JWT}
+      # BP keeps its own RingCentral account and its own board. Not required: a deployment
+      # that has only brought JM online still starts, and asking for BP says so plainly.
+      MONDAY_BOARD_ID_BP: ${MONDAY_BOARD_ID_BP:-0}
+      RC_CLIENT_ID_BP: ${RC_CLIENT_ID_BP:-}
+      RC_CLIENT_SECRET_BP: ${RC_CLIENT_SECRET_BP:-}
+      RC_JWT_BP: ${RC_JWT_BP:-}
+      DB_URL: jdbc:postgresql://postgres-identity:5432/drenix_performance
+      DB_USER: performance_app
+      DB_PASSWORD: ${PERFORMANCE_DB_PASSWORD}
+      USER_SERVICE_HOST: user-service
+      # Written feedback. Without it the feedback endpoint answers 503 and nothing else changes.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      # Points at OpenAI unless overridden — a self-hosted or compatible endpoint works too.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      # The zone every date, shift window and hour label is expressed in. The recruiters work
+      # 18:00-01:00 Tashkent, which is 13:00-20:00 UTC, so asking for an 18:00-03:00 shift only
+      # means what it says in this zone.
+      RC_ZONE: ${RC_ZONE:-Asia/Tashkent}
+      TLS_CERT_PATH: /etc/drenix/tls/performance-service.crt
+      TLS_KEY_PATH: /etc/drenix/tls/performance-service.key
+      TLS_CA_PATH: /etc/drenix/tls/internal-ca.crt
+    volumes:
+      - ./tls:/etc/drenix/tls:ro
+    depends_on:
+      postgres-identity: { condition: service_healthy }
+      auth-service: { condition: service_started }
+      user-service: { condition: service_started }
+    expose: ["9094"]
+
+  notification-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        MODULE: notification-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres-identity:5432/drenix_notification
+      DB_USER: notification_app
+      DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD}
+      JWKS_URI: https://auth-service:9443/.well-known/jwks.json
+      USER_SERVICE_HOST: user-service
+      PERFORMANCE_SERVICE_HOST: performance-service
+      # Must match performance-service, or the shift window judges hours nobody worked.
+      RC_ZONE: ${RC_ZONE:-Asia/Tashkent}
+      TLS_CERT_PATH: /etc/drenix/tls/notification-service.crt
+      TLS_KEY_PATH: /etc/drenix/tls/notification-service.key
+      TLS_CA_PATH: /etc/drenix/tls/internal-ca.crt
+    volumes:
+      - ./tls:/etc/drenix/tls:ro
+    depends_on:
+      postgres-identity: { condition: service_healthy }
+      user-service: { condition: service_started }
+      performance-service: { condition: service_started }
+    expose: ["9096"]
+
+  edge-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        MODULE: edge-gateway
+    environment:
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      USER_SERVICE_HOST: user-service
+      AUTH_SERVICE_HOST: auth-service
+      PERFORMANCE_SERVICE_HOST: performance-service
+      NOTIFICATION_SERVICE_HOST: notification-service
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3005}
+      PUBLIC_TLS_ENABLED: "false"     # terminate TLS at the ingress in front of this
+      TLS_CERT_PATH: /etc/drenix/tls/edge-gateway.crt
+      TLS_KEY_PATH: /etc/drenix/tls/edge-gateway.key
+      TLS_CA_PATH: /etc/drenix/tls/internal-ca.crt
+    volumes:
+      - ./tls:/etc/drenix/tls:ro
+    depends_on:
+      auth-service: { condition: service_started }
+      performance-service: { condition: service_started }
+      notification-service: { condition: service_started }
+    ports:
+      - "127.0.0.1:8443:8443"          # bound to loopback, not 0.0.0.0
+
+volumes:
+  identity-data:
+  redis-data:

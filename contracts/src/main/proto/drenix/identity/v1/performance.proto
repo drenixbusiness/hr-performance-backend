@@ -1,0 +1,393 @@
+syntax = "proto3";
+
+package drenix.identity.v1;
+
+import "drenix/identity/v1/common.proto";   // Entity
+
+option java_package = "uz.drenix.identity.grpc.v1";
+option java_multiple_files = true;
+
+// ---------------------------------------------------------------------------
+// HR recruiting performance.
+//
+// The numbers come from a monday.com board, not from this system's database:
+// drivers are hired and terminated in monday, and this service only reads and
+// aggregates. Nothing here writes back.
+// ---------------------------------------------------------------------------
+
+// One calendar month of one recruiter's results.
+message MonthlyPoint {
+  string month = 1;        // YYYY-MM
+  int32 hired = 2;         // drivers whose hire date falls in this month
+  int32 terminated = 3;    // drivers whose termination date falls in this month
+  // Drivers hired on or before the end of this month who had not left by then.
+  // A point-in-time figure, not a running total of hired minus terminated.
+  int32 active = 4;
+  // Which of the recruiter's own quarters this month belongs to, 1-4, counted
+  // from their first ever hire. 0 when the month falls outside their first year.
+  int32 quarter = 5;
+  // The month has not happened yet. Its counts are all zero rather than a
+  // projection, so a chart can stop its lines here instead of drawing a cliff.
+  bool future = 6;
+}
+
+// The standard a quarter is measured against, and what actually happened.
+message QuarterResult {
+  int32 quarter = 1;               // 1-4
+  string first_month = 2;          // YYYY-MM, inclusive
+  string last_month = 3;           // YYYY-MM, inclusive
+  int32 required_hires_per_month = 4;
+  int32 required_hires_total = 5;
+  int32 required_active = 6;
+  int32 actual_hires_total = 7;
+  // Active drivers at the end of the quarter's last month.
+  int32 actual_active_at_end = 8;
+  bool hires_met = 9;
+  bool active_met = 10;
+  // False when the quarter has not finished yet, so a miss is not yet a miss.
+  bool complete = 11;
+}
+
+message RecruiterPerformance {
+  // The board this recruiter came from. Always set, so a caller reading both
+  // companies can tell two people with the same first name apart.
+  Entity entity = 10;
+  string recruiter = 1;            // as spelled in the board's Source column
+  // The matching account in this system, empty when no user has that full name.
+  string user_id = 2;
+  string started_month = 3;        // YYYY-MM of their earliest hire
+  repeated MonthlyPoint months = 4;
+  repeated QuarterResult quarters = 5;
+  int32 active_now = 6;            // drivers currently in the Loaded group
+  int32 required_active_after_year = 7;
+  bool year_target_met = 8;
+  bool year_complete = 9;
+}
+
+// Something in the board that the numbers could not fully account for. Reported
+// rather than hidden: a chart that quietly drops rows teaches people to distrust it.
+message DataIssue {
+  Entity entity = 5;               // which board the row is on
+  string item_name = 1;
+  string recruiter = 2;
+  string problem = 3;              // human-readable
+  string kind = 4;                 // MISSING_HIRE_DATE | MISSING_TERMINATION_DATE | TERMINATION_BEFORE_HIRE
+}
+
+message HrPerformanceRequest {
+  int32 year = 1;                  // calendar year to chart; 0 means the current one
+  string recruiter = 2;            // optional, one recruiter only
+  // Which company's board to read. JM and BP keep separate boards, so a
+  // recruiter exists on exactly one of them. Unspecified reads every
+  // configured board and tags each recruiter with the one they came from.
+  Entity entity = 3;
+}
+
+message HrPerformanceResponse {
+  int32 year = 1;
+  repeated RecruiterPerformance recruiters = 2;
+  repeated DataIssue issues = 3;
+  // When the board was last read. The service caches, so this can lag slightly.
+  int64 generated_at_epoch_seconds = 4;
+}
+
+service PerformanceService {
+  rpc GetHrPerformance(HrPerformanceRequest) returns (HrPerformanceResponse);
+  rpc GetHrActivity(HrActivityRequest) returns (HrActivityResponse);
+  // Read back the stored daily snapshots. Cheap, and it works for any range.
+  rpc GetActivityHistory(ActivityHistoryRequest) returns (ActivityHistoryResponse);
+  // One row per person, activity and hiring together. What the export writes.
+  rpc GetTeamReport(TeamReportRequest) returns (TeamReportResponse);
+  // The same rows, handed to a language model and returned as prose.
+  rpc GenerateFeedback(FeedbackRequest) returns (FeedbackResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Phone and SMS activity, read from RingCentral.
+//
+// The caller decides whose numbers to ask about; this service does not know
+// who anybody is. Authorization lives at the gateway, which holds the token
+// and the user directory — keeping it out of here means the RingCentral
+// integration cannot accidentally widen who sees what.
+// ---------------------------------------------------------------------------
+
+// The bar every recruiter is measured against, for one whole shift.
+//
+// `shift_minutes` is what makes a part-day question answerable: asking for
+// 18:00-03:00 is asking about nine hours of a nine-hour shift, and the targets
+// are scaled by that ratio rather than compared against a full day.
+message ActivityStandard {
+  int32 calls_per_day = 1;
+  int32 talk_seconds_per_day = 2;
+  int32 sms_sent_per_day = 3;
+  int32 shift_minutes = 4;      // length of a full shift; 540 is nine hours
+}
+
+// One clock hour inside a shift.
+message HourPoint {
+  string hour = 1;             // YYYY-MM-DDTHH:00, in the reporting zone
+  int32 calls = 2;
+  int32 talk_seconds = 3;
+  int32 sms_sent = 4;
+}
+
+message DailyActivity {
+  // The day the shift STARTED. A shift running 18:00-03:00 on the night of the
+  // 27th is reported under 2026-08-27 in full, not split across two dates.
+  string date = 1;             // YYYY-MM-DD
+  int32 calls = 2;             // every attempt, in either direction
+  int32 talk_seconds = 3;      // summed call duration
+  int32 sms_sent = 4;          // outbound only
+  // Measured against the window standard, which equals the full standard when
+  // no time window was asked for.
+  bool calls_met = 5;
+  bool talk_met = 6;
+  bool sms_met = 7;
+  repeated HourPoint hours = 8;
+}
+
+message AgentActivity {
+  // The id from the AgentSelector this row answers, or the number itself when
+  // the deprecated flat request was used.
+  string agent_id = 10;
+  // The first of the numbers. Kept for clients written before a person could
+  // have several.
+  string ring_central_phone = 1;
+  // Every number counted into this row.
+  repeated string ring_central_phones = 11;
+  // The numbers that never appeared in the call log, so nothing could be read
+  // for them. A subset of ring_central_phones.
+  repeated string unresolved_phones = 12;
+  string display_name = 2;         // the name RingCentral has on the extension
+  string extension_id = 3;         // empty when the extension could not be identified
+  repeated DailyActivity days = 4;
+  int32 total_calls = 5;
+  int64 total_talk_seconds = 6;
+  int32 total_sms_sent = 7;
+  // Days in the range on which anything at all happened. A recruiter on leave
+  // should not be averaged against days they were not working.
+  int32 active_days = 8;
+  // True when NONE of the numbers was seen in the call log for this range, so
+  // nothing could be read at all. Distinguishes "no activity" from "we could
+  // not find them". When only some numbers are missing this stays false and
+  // unresolved_phones names them.
+  bool extension_unresolved = 9;
+}
+
+// One person and every number their work is spread across.
+//
+// The caller groups the numbers, because only the caller knows which ones
+// belong to the same person. performance-service adds a group up into one row
+// and never learns whose it is.
+message AgentSelector {
+  // Echoed back on the matching AgentActivity so the caller can pair them up.
+  // Anything unique within one request; the gateway sends the account id.
+  string id = 1;
+  repeated string ring_central_phones = 2;
+  // Which company's RingCentral account these numbers live in. JM and BP are
+  // separate accounts with separate credentials, and a number from one does
+  // not exist in the other. Unspecified falls back to the configured default.
+  Entity entity = 3;
+}
+
+message HrActivityRequest {
+  // Deprecated: one row per number, which splits a lead who works two
+  // extensions into two half-people. Use agents. Still honoured when agents is
+  // empty, each number becoming a group of its own.
+  repeated string ring_central_phones = 1;
+  string from_date = 2;        // YYYY-MM-DD, inclusive
+  string to_date = 3;          // YYYY-MM-DD, inclusive
+  // Optional clock window, HH:MM. Both or neither. When to_time is less than or
+  // equal to from_time the window crosses midnight and ends on the next day.
+  string from_time = 4;
+  string to_time = 5;
+  // The standard to judge against. The gateway reads it from the database so it
+  // can be changed without a release; unset falls back to this service config.
+  ActivityStandard standard = 6;
+  repeated AgentSelector agents = 7;
+}
+
+message HrActivityResponse {
+  string from_date = 1;
+  string to_date = 2;
+  ActivityStandard standard = 3;          // per full shift
+  repeated AgentActivity agents = 4;
+  int64 generated_at_epoch_seconds = 5;
+  string from_time = 6;                   // HH:MM, empty when the whole day was asked for
+  string to_time = 7;
+  int32 window_minutes = 8;               // length of the window actually counted
+  // The standard scaled to window_minutes. Equal to `standard` when no window
+  // was given. This is what calls_met / talk_met / sms_met are judged against.
+  ActivityStandard window_standard = 9;
+  string zone = 10;                       // the zone the dates and hours are in
+}
+
+// ---------------------------------------------------------------------------
+// Stored history, the team report, and written feedback.
+//
+// RingCentral keeps the call log, but reading a month of it costs minutes of
+// throttled paging and cannot be done on demand. A snapshot of each finished
+// shift is therefore written to this service's own database as it happens, and
+// every question about a past range is answered from there instead.
+// ---------------------------------------------------------------------------
+
+message ActivityHistoryRequest {
+  // Account ids, exactly as they were recorded. Whose numbers they are was
+  // decided when the snapshot was taken; this only reads it back.
+  repeated string user_ids = 1;
+  string from_date = 2;          // YYYY-MM-DD, inclusive, shift start dates
+  string to_date = 3;            // YYYY-MM-DD, inclusive
+  // The bar to judge the stored figures against. Applied at read time, so
+  // changing the standard re-judges history rather than rewriting it.
+  ActivityStandard standard = 4;
+}
+
+message AgentHistory {
+  string agent_id = 1;
+  repeated DailyActivity days = 2;   // one per recorded shift, oldest first
+  int32 total_calls = 3;
+  int64 total_talk_seconds = 4;
+  int32 total_sms_sent = 5;
+  // Shifts with a stored row. Fewer than the range asked for means the
+  // snapshot did not run then — not that nobody worked.
+  int32 recorded_days = 6;
+  // Shifts where all three targets were met.
+  int32 days_all_targets_met = 7;
+}
+
+message ActivityHistoryResponse {
+  string from_date = 1;
+  string to_date = 2;
+  ActivityStandard standard = 3;
+  repeated AgentHistory agents = 4;
+  string zone = 5;
+}
+
+// One person, and everything the report and the feedback need to know to
+// find them in the two external systems.
+message ReportSubject {
+  string id = 1;                 // the account id, echoed back on the row
+  string name = 2;               // for display, and for the written feedback
+  repeated string ring_central_phones = 3;
+  Entity entity = 4;
+  // What the monday board's Source column calls them. Empty means the hiring
+  // figures cannot be filled in for this person.
+  string monday_name = 5;
+  // The day they started, YYYY-MM-DD, when somebody has recorded it. It decides
+  // which quarter of their own tenure the reported month falls in. Empty falls
+  // back to their first hire on the board.
+  string employment_start_date = 7;
+  // "HR Leader", "HR", "CEO" - what this person does, for the written report.
+  // Derived from their roles by the gateway; this service does not know roles.
+  string position = 6;
+}
+
+message TeamReportRow {
+  string agent_id = 1;
+  string name = 2;
+  Entity entity = 3;
+
+  // From the stored daily snapshots, summed over the range.
+  int32 calls = 4;
+  int64 talk_seconds = 5;
+  int32 sms_sent = 6;
+  int32 recorded_days = 7;
+  int32 days_all_targets_met = 8;
+
+  // What they should have done over the same number of recorded shifts.
+  int32 calls_target = 9;
+  int64 talk_seconds_target = 10;
+  int32 sms_sent_target = 11;
+
+  // From the monday board, scoped to the reported period: drivers whose hire
+  // date falls inside it, whose termination date falls inside it, and how many
+  // of that period's hires are still driving today. This is what a monthly
+  // report is asking — "what did this person do in August", not "ever".
+  int32 hired_in_period = 16;
+  int32 terminated_in_period = 17;
+  int32 still_active_from_period = 18;
+
+  // The same three counted over all time, for context beside the period ones.
+  int32 hired_to_date = 12;
+  int32 active_now = 13;
+  int32 terminated_to_date = 14;
+  // False when monday_name was empty or matched no row, so every hiring figure
+  // is a zero meaning "unknown" rather than "none".
+  bool board_matched = 15;
+
+  // The recruiting standard, for the month reported.
+  //
+  // Quarters are counted from the recruiter's own first hire, not from January,
+  // so two people who started in different months are measured against the same
+  // shape of target at the same point in their own tenure. The count keeps
+  // going past four: somebody in their fifth quarter is held to the fourth
+  // quarter's standard for as long as they stay, because the alternative is a
+  // recruiter with a year behind them having no target at all. 0 means the
+  // board matched nobody, so no quarter could be worked out.
+  int32 recruiting_quarter = 19;
+  int32 required_hires_in_month = 20;
+  int32 required_active = 21;
+  // Drivers on the books when the reported month ended. Compared against
+  // required_active; a point-in-time count, not hires minus terminations.
+  int32 active_at_month_end = 22;
+
+  // Echoed from the ReportSubject, so the report can tell a lead from an HR.
+  string position = 23;
+
+  // Tenure, as the board evidences it.
+  //
+  // This system holds no employment start date, so the earliest hire credited
+  // to this person stands in for one. It is the only evidence either external
+  // system offers of when they began recruiting, and it is what the quarter is
+  // counted from. Empty when the board matched nobody.
+  string tenure_start_month = 24;      // YYYY-MM
+  int32 tenure_months = 25;            // whole months elapsed since it
+  // Where tenure_start_month came from: RECORDED when somebody entered an
+  // employment start date, INFERRED when it was taken from the first hire on
+  // the board. An inferred date can only be later than the truth, so a report
+  // should say which it is rather than presenting a guess as a fact.
+  string tenure_source = 29;
+
+  // Where the reported month sits inside the current quarter: 1, 2 or 3. A
+  // quarter still running cannot be judged against its full three-month
+  // target, and this is the field that says so.
+  int32 quarter_month = 26;
+
+  // Hires across the whole of the current quarter so far, and what the
+  // standard asks for over its three months.
+  int32 hired_in_quarter = 27;
+  int32 required_hires_in_quarter = 28;
+}
+
+message TeamReportRequest {
+  repeated ReportSubject subjects = 1;
+  string from_date = 2;
+  string to_date = 3;
+  ActivityStandard standard = 4;
+}
+
+message TeamReportResponse {
+  string from_date = 1;
+  string to_date = 2;
+  ActivityStandard standard = 3;
+  repeated TeamReportRow rows = 4;
+  int64 generated_at_epoch_seconds = 5;
+}
+
+message FeedbackRequest {
+  repeated ReportSubject subjects = 1;
+  string from_date = 2;
+  string to_date = 3;
+  ActivityStandard standard = 4;
+  // Free text from the person asking, appended to the prompt. Optional.
+  string question = 5;
+}
+
+message FeedbackResponse {
+  string feedback = 1;           // markdown
+  string model = 2;
+  int32 subjects_covered = 3;
+  // The rows the feedback was written from, so a client can show the numbers
+  // beside the words rather than asking for them again.
+  repeated TeamReportRow rows = 4;
+}

@@ -1,0 +1,108 @@
+# Production overlay. Applied on top of docker-compose.yml, never instead of it:
+#
+#   docker compose --env-file .env -f deploy/docker-compose.yml \
+#                                 -f deploy/docker-compose.prod.yml up -d
+#
+# The base file describes the topology — who talks to whom, which volumes exist, which ports stay
+# internal. Repeating that here would give two descriptions of one system that drift apart. This
+# file adds only what production needs and development does not: a restart policy, health checks,
+# bounded logs, and the API documentation turned off.
+#
+# Everything stays on the private compose network. The one published socket is the gateway on
+# 127.0.0.1:8443, which host nginx proxies to. Nothing binds 0.0.0.0.
+name: drenix-backend
+
+x-prod: &prod
+  # `unless-stopped` survives a crash, a Docker daemon restart and a server reboot — but not an
+  # operator who deliberately stopped a service during an incident. `always` would restart that
+  # one too, which is how a half-fixed problem comes back at 3am.
+  restart: unless-stopped
+  logging:
+    # Without this, container logs grow until the disk fills, and a full disk stops Postgres
+    # before it stops anything else. Ten files of 20MB is roughly a fortnight of this system.
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "10"
+
+x-java-health: &java-health
+  interval: 30s
+  timeout: 5s
+  retries: 5
+  # A cold JVM with Flyway to run takes well over a minute. Without the grace period Docker
+  # marks the service unhealthy while it is still starting normally.
+  start_period: 120s
+
+services:
+  postgres-identity:
+    <<: *prod
+    # The data lives on the named volume declared in the base file. A deployment must never
+    # recreate it; scripts/deploy.sh refuses `down -v` for exactly that reason.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U identity_app -d drenix_identity"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    <<: *prod
+    stop_grace_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # The Java services.
+  #
+  # The runtime image is a JRE: no curl, no wget, no netcat. It does have bash, so the probe
+  # opens the socket with bash's /dev/tcp and reads the status line. `CMD-SHELL` would run under
+  # dash, which has no /dev/tcp at all, so each probe names bash explicitly.
+  #
+  # Each service is probed on its own actuator port, which is internal to the container.
+  # ---------------------------------------------------------------------------
+  user-service:
+    <<: *prod
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9091 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200'"]
+      <<: *java-health
+
+  auth-service:
+    <<: *prod
+    healthcheck:
+      # No HTTP port of its own worth probing — 9443 is the JWKS document over TLS. Opening the
+      # gRPC socket is the honest liveness signal: if it accepts a connection, the server is up.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9092"]
+      <<: *java-health
+
+  performance-service:
+    <<: *prod
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9095 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200'"]
+      <<: *java-health
+
+  notification-service:
+    <<: *prod
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9097 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200'"]
+      <<: *java-health
+
+  edge-gateway:
+    <<: *prod
+    environment:
+      # Same-origin in production: the frontend and the API both live at
+      # https://performance.drenix.uz, so the browser sends no cross-origin request at all and
+      # this list matters only to a stray tool. It stays an explicit allowlist regardless — a
+      # wildcard with credentials hands any site on the internet a session.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS}
+      # TLS terminates at nginx; this speaks plain HTTP on a loopback socket.
+      PUBLIC_TLS_ENABLED: "false"
+      # Swagger publishes every endpoint and the permission each one needs. That is a map of the
+      # attack surface, so it is off unless somebody deliberately turns it on.
+      API_DOCS_ENABLED: ${API_DOCS_ENABLED:-false}
+    healthcheck:
+      # The public liveness endpoint, on the public port. This is what nginx, the deployment
+      # script and CI all check, so probing anything else here would test the wrong thing.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8443 && printf 'GET /api/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200'"]
+      <<: *java-health
+    ports:
+      # Loopback only. nginx on the host is the sole client; nothing off the machine can reach
+      # this socket even if the firewall were wrong.
+      - "127.0.0.1:8443:8443"

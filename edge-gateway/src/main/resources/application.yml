@@ -1,0 +1,89 @@
+spring:
+  application:
+    name: edge-gateway
+  threads:
+    virtual:
+      enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+      timeout: 2s
+
+server:
+  port: ${SERVER_PORT:8443}
+  # TLS is terminated at the ingress in front of this service by default. Turn it on here only
+  # when the gateway is exposed directly, and supply a bundle under spring.ssl.bundle.pem.
+  ssl:
+    enabled: ${PUBLIC_TLS_ENABLED:false}
+  # Bounded request sizes: an unbounded body is a cheap way to exhaust the JVM.
+  max-http-request-header-size: 16KB
+  tomcat:
+    max-swallow-size: 2MB
+    max-http-form-post-size: 256KB
+  forward-headers-strategy: native
+
+drenix:
+  gateway:
+    allowed-origins: ${ALLOWED_ORIGINS:http://localhost:3005}
+    issuer: ${TOKEN_ISSUER:https://auth.drenix.uz}
+    audience: ${TOKEN_AUDIENCE:drenix-internal}
+    jwks-uri: ${JWKS_URI:https://auth-service:9443/.well-known/jwks.json}
+  tls:
+    certificate: ${TLS_CERT_PATH:/etc/drenix/tls/edge-gateway.crt}
+    private-key: ${TLS_KEY_PATH:/etc/drenix/tls/edge-gateway.key}
+    ca: ${TLS_CA_PATH:/etc/drenix/tls/internal-ca.crt}
+  clients:
+    user-service:
+      host: ${USER_SERVICE_HOST:user-service}
+      port: ${USER_SERVICE_PORT:9090}
+    auth-service:
+      host: ${AUTH_SERVICE_HOST:auth-service}
+      port: ${AUTH_SERVICE_PORT:9092}
+    performance-service:
+      host: ${PERFORMANCE_SERVICE_HOST:performance-service}
+      port: ${PERFORMANCE_SERVICE_PORT:9094}
+    notification-service:
+      host: ${NOTIFICATION_SERVICE_HOST:notification-service}
+      port: ${NOTIFICATION_SERVICE_PORT:9096}
+
+# OpenAPI document and Swagger UI, at http://localhost:8443/swagger-ui.html
+#
+# Both are reachable without a token — a login form nobody can open is not a login form.
+# That also means the document lists every endpoint and the permission each one needs.
+# On anything internet-facing set API_DOCS_ENABLED=false; the paths then 404 and the
+# security chain in GatewaySecurityConfig has nothing to let through.
+springdoc:
+  api-docs:
+    enabled: ${API_DOCS_ENABLED:true}
+    path: /v3/api-docs
+  swagger-ui:
+    enabled: ${API_DOCS_ENABLED:true}
+    path: /swagger-ui.html
+    # Show the endpoints in the order the controllers declare them rather than alphabetically,
+    # so login sits at the top of Authentication where a first-time reader looks for it.
+    operations-sorter: alpha
+    tags-sorter: alpha
+    display-request-duration: true
+    # Collapsed to the group headings on open; a wall of expanded endpoints hides the structure.
+    doc-expansion: none
+    persist-authorization: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+  server:
+    port: ${MANAGEMENT_PORT:8444}
+
+logging:
+  level:
+    root: INFO
+    uz.drenix: DEBUG
+  pattern:
+    level: "%5p [${spring.application.name},%X{correlationId:-}]"
