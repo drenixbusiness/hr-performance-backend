@@ -13,7 +13,12 @@ spring:
       # here plus ten in each of the other two services was 36 backends for a system serving ten
       # people — hundreds of megabytes of Postgres for connections that sit idle. Four is more
       # than this service needs; DB_POOL_SIZE raises it without a release if that turns out wrong.
-      maximum-pool-size: ${DB_POOL_SIZE:16}
+      maximum-pool-size: ${DB_POOL_SIZE:4}
+      # Baza alohida stack'da: compose endi uni kutib turolmaydi (depends_on faqat bir
+      # loyiha ichida ishlaydi). Hikari o'zi kutadi - 60 soniya. Aks holda baza
+      # bir soniya kech ko'tarilsa, bu servis yiqilib qayta-qayta boot bo'lardi, va
+      # 2 GiB li serverda JVM boot'ini takrorlash eng qimmat ish.
+      initialization-fail-timeout: ${DB_INIT_TIMEOUT:60000}
       minimum-idle: 1
       # Hand an idle connection back rather than holding it open all night.
       idle-timeout: 60000

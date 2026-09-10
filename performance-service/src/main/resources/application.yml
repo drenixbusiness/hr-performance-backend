@@ -11,7 +11,12 @@ spring:
     hikari:
       # See user-service for why this is small. This service writes one snapshot row per person
       # per hour and reads a month at a time; it has never needed more than two.
-      maximum-pool-size: ${DB_POOL_SIZE:10}
+      maximum-pool-size: ${DB_POOL_SIZE:3}
+      # Baza alohida stack'da: compose endi uni kutib turolmaydi (depends_on faqat bir
+      # loyiha ichida ishlaydi). Hikari o'zi kutadi - 60 soniya. Aks holda baza
+      # bir soniya kech ko'tarilsa, bu servis yiqilib qayta-qayta boot bo'lardi, va
+      # 2 GiB li serverda JVM boot'ini takrorlash eng qimmat ish.
+      initialization-fail-timeout: ${DB_INIT_TIMEOUT:60000}
       minimum-idle: 1
       idle-timeout: 60000
       max-lifetime: 900000

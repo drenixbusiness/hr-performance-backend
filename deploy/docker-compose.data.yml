@@ -1,0 +1,114 @@
+# ---------------------------------------------------------------------------
+# Ma'lumotlar qatlami — Postgres va Redis.
+#
+# Bu ilovadan ALOHIDA deploy qilinadi. Sababi:
+#
+#   - Ilovani qayta deploy qilish bazaga umuman tegmaydi. Hozirgi holatda har
+#     `up -d` Postgres konteynerini ham ko'rib chiqadi; konfiguratsiya
+#     o'zgargan bo'lsa uni qayta yaratadi — ya'ni baza deploy paytida uziladi.
+#   - `down -v` xatosi endi bazani o'chira olmaydi: u boshqa loyihada.
+#   - Ilova deploy'i tezlashadi va CPU cho'qqisi pasayadi — baza allaqachon
+#     ishlab turadi, uni kutish shart emas.
+#   - Baza va Redis kamdan-kam o'zgaradi; ilova esa kuniga bir necha marta.
+#
+# DIQQAT: bu RAM tejamaydi. Postgres va Redis baribir shu serverda ishlaydi,
+# jami ~35 MiB. Foyda — barqarorlik va deploy tezligi, xotira emas.
+#
+# Dokploy'da: ikkinchi Compose ilovasi yarating, Compose Path:
+#   ./deploy/docker-compose.data.yml
+#
+# BIRINCHI DEPLOY'DAN OLDIN tarmoqni qo'lda yarating (bir marta):
+#   docker network create drenix-internal
+#
+# Kerakli environment: IDENTITY_DB_PASSWORD, NOTIFICATION_DB_PASSWORD,
+# PERFORMANCE_DB_PASSWORD, REDIS_PASSWORD — ilova stack'idagi bilan
+# AYNAN BIR XIL bo'lishi shart.
+# ---------------------------------------------------------------------------
+name: drenix-data
+
+x-prod: &prod
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+networks:
+  # Ikkala stack ham shu tarmoqqa ulanadi. `external` — ya'ni compose uni
+  # yaratmaydi va o'chirmaydi; u ikkalasidan ham uzoq yashaydi.
+  drenix-internal:
+    external: true
+
+volumes:
+  # Aniq nom berilgan: loyiha nomi prefiks qilinmaydi. Shu tufayli volume
+  # stack nomiga bog'liq emas va uni yo'qotib qo'yish qiyinroq.
+  identity-data:
+    name: drenix-identity-data
+  redis-data:
+    name: drenix-redis-data
+
+services:
+  postgres-identity:
+    <<: *prod
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: drenix_identity
+      POSTGRES_USER: identity_app
+      POSTGRES_PASSWORD: ${IDENTITY_DB_PASSWORD:?set IDENTITY_DB_PASSWORD}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?set NOTIFICATION_DB_PASSWORD}
+      PERFORMANCE_DB_PASSWORD: ${PERFORMANCE_DB_PASSWORD:?set PERFORMANCE_DB_PASSWORD}
+    # Uchta kichik baza va o'ntacha ulanish uchun sozlangan, data warehouse
+    # uchun emas.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=48MB          # default 128MB
+      - -c
+      - max_connections=20           # default 100; the three pools total 9
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - effective_cache_size=192MB
+      - -c
+      - max_worker_processes=2
+      - -c
+      - max_parallel_workers=2
+      - -c
+      - max_parallel_workers_per_gather=0
+    volumes:
+      - identity-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    networks: [drenix-internal]
+    mem_limit: ${MEM_POSTGRES:-120m}
+    cpus: ${CPU_POSTGRES:-0.40}
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U identity_app -d drenix_identity"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    <<: *prod
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      --appendonly yes
+      --maxmemory ${REDIS_MAXMEMORY:-32mb}
+      --maxmemory-policy noeviction
+      --save ""
+    volumes:
+      - redis-data:/data
+    networks: [drenix-internal]
+    mem_limit: ${MEM_REDIS:-40m}
+    cpus: ${CPU_REDIS:-0.15}
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

@@ -22,8 +22,13 @@
 #   Internet ──80/443──> Traefik (Dokploy owns it) ──┬── /api ──> edge-gateway:8443
 #                                                    └── /    ──> the frontend app, added later
 #
-# Everything else stays on the private `drenix-internal` network: the four gRPC services, both
-# databases and Redis are unreachable from Traefik and from the host.
+# Everything else stays on the private `drenix-internal` network: the four gRPC services, and
+# the database stack that joins the same network, are unreachable from Traefik and from the host.
+#
+# `drenix-internal` is an EXTERNAL network — compose neither creates nor deletes it, because the
+# data stack (deploy/docker-compose.data.yml) shares it. Create it once, before the first deploy:
+#
+#     docker network create drenix-internal
 #
 # WHAT YOU SET IN THE DOKPLOY UI, NOT HERE:
 #
@@ -67,19 +72,26 @@ x-prod: &prod
 #
 #   service               limit    heap     why that much
 #   ------------------------------------------------------------------------
-#   user-service          300m     140m     Argon2id hashing allocates per login
-#   auth-service          260m     120m     token signing; almost no allocation
-#   notification-service  260m     120m     polls an audit page every minute
+#   user-service          440m     150m     Argon2id hashing allocates per login
+#   auth-service          240m     120m     token signing; almost no allocation
+#   notification-service  320m     130m     polls an audit page every minute
 #   performance-service   380m     200m     reads 20,000 RingCentral records at once
-#   edge-gateway          340m     180m     renders the monthly PDF in memory
-#   postgres              160m
-#   redis                  48m
+#   edge-gateway          320m     180m     renders the monthly PDF in memory
 #   ------------------------------------------------------------------------
-#   total                1748m  =  1.71 GiB
+#   total                1700m  =  1.66 GiB   (measured in use: 1.16-1.34 GiB)
 #
-# Dokploy itself — its Node app, Traefik, its own Postgres and Redis — needs roughly 500 MiB more,
-# and the OS another 150. That is 2.4 GiB on a 2 GiB machine. See docs/OPTIMIZATION.md: this
-# configuration is the most that can be squeezed out, and the machine still wants 4 GiB.
+# Postgres and Redis are NOT here any more. They live in their own stack,
+# deploy/docker-compose.data.yml (another 160m between them), so that redeploying the
+# application cannot touch the database. See docs/BAZANI-AJRATISH.md.
+#
+# The ceilings above sit deliberately close to measured use. A generous ceiling is worse on a
+# small box: when RAM runs out the kernel picks a victim at random and may kill Postgres or
+# Dokploy, taking the whole machine down. A tight ceiling kills only the service at fault,
+# which then restarts on its own.
+#
+# Dokploy itself — its Node app, Traefik, its own Postgres and Redis — needs roughly 500 MiB
+# more, and the OS another 150. See docs/2GB-SERVER.md for what that means on 2 GiB and how to
+# claw memory back.
 # ---------------------------------------------------------------------------
 
 # Flags shared by every JVM. Each service adds its own -Xmx.
@@ -103,7 +115,7 @@ x-java-health: &java-health
   interval: 30s
   timeout: 5s
   retries: 5
-  start_period: 120s
+  start_period: 240s
 
 networks:
   # Dokploy creates this. Traefik lives on it, so anything that needs to be reachable from the
@@ -112,11 +124,9 @@ networks:
     external: true
   # Everything internal. No route to Traefik, no route to the host.
   drenix-internal:
-    driver: bridge
+    external: true
 
 volumes:
-  identity-data:
-  redis-data:
   # The internal mTLS material. Generated once by the init service below and kept in a volume,
   # because `deploy/tls/` is gitignored — a git-based deploy arrives with no certificates at all,
   # and without them no service can talk to any other.
@@ -151,75 +161,6 @@ services:
     networks: [drenix-internal]
     restart: "no"
 
-  postgres-identity:
-    <<: *prod
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_DB: drenix_identity
-      POSTGRES_USER: identity_app
-      POSTGRES_PASSWORD: ${IDENTITY_DB_PASSWORD:?set IDENTITY_DB_PASSWORD}
-      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?set NOTIFICATION_DB_PASSWORD}
-      PERFORMANCE_DB_PASSWORD: ${PERFORMANCE_DB_PASSWORD:?set PERFORMANCE_DB_PASSWORD}
-    # Sized for three small databases and about a dozen connections, not for a data warehouse.
-    # The stock configuration assumes a machine that exists to be a database server; this one is
-    # sharing 2GB with five JVMs and Dokploy.
-    command:
-      - postgres
-      - -c
-      - shared_buffers=48MB          # default 128MB
-      - -c
-      - max_connections=40           # default 100; we use about 14
-      - -c
-      - work_mem=2MB
-      - -c
-      - maintenance_work_mem=32MB
-      - -c
-      - effective_cache_size=192MB
-      - -c
-      - max_worker_processes=2
-      - -c
-      - max_parallel_workers=2
-      - -c
-      - max_parallel_workers_per_gather=0   # no query here is big enough to be worth a second core
-    volumes:
-      - identity-data:/var/lib/postgresql/data
-      - ./postgres-init:/docker-entrypoint-initdb.d:ro
-    networks: [drenix-internal]
-    mem_limit: ${MEM_POSTGRES:-160m}
-    stop_grace_period: 30s
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U identity_app -d drenix_identity"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    <<: *prod
-    image: redis:7-alpine
-    command: >
-      redis-server
-      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
-      --appendonly yes
-      --maxmemory ${REDIS_MAXMEMORY:-32mb}
-      --maxmemory-policy noeviction
-      --save ""
-    volumes:
-      - redis-data:/data
-    networks: [drenix-internal]
-    # It holds sessions, refresh tokens and rate-limit counters for ten people — kilobytes. It was
-    # measured at 8 MiB. `noeviction` stays: silently evicting a session logs somebody out for no
-    # visible reason, and a full Redis here would mean something else is very wrong.
-    #
-    # `--save ""` turns off RDB snapshotting. The append-only log already persists every write,
-    # and a fork-to-snapshot on a memory-starved box is exactly when the OOM killer arrives.
-    mem_limit: ${MEM_REDIS:-48m}
-    stop_grace_period: 15s
-    healthcheck:
-      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
   user-service:
     <<: *prod
     image: ${IMAGE_PREFIX:-ghcr.io/drenixbusiness/hr-performance-backend}/user-service:${IMAGE_TAG:-main}
@@ -235,18 +176,18 @@ services:
       # expensive to crack. It also means logins allocate, so this heap is the largest of the
       # three small services.
       JAVA_TOOL_OPTIONS: >-
-        -Xmx${HEAP_USER:-140m}
+        -Xmx${HEAP_USER:-150m}
         -XX:+UseSerialGC -XX:TieredStopAtLevel=1
-        -XX:MaxMetaspaceSize=96m -XX:ReservedCodeCacheSize=32m
+        -XX:MaxMetaspaceSize=${META_LIMIT:-256m} -XX:ReservedCodeCacheSize=32m
         -Xss512k -XX:+ExitOnOutOfMemoryError
       MALLOC_ARENA_MAX: "2"
       DB_POOL_SIZE: ${DB_POOL_SIZE:-4}
     volumes:
       - internal-tls:/etc/drenix/tls:ro
     networks: [drenix-internal]
-    mem_limit: ${MEM_USER:-300m}
+    mem_limit: ${MEM_USER:-440m}
+    cpus: ${CPU_USER:-0.50}
     depends_on:
-      postgres-identity: { condition: service_healthy }
       tls-init: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9091 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200'"]
@@ -267,16 +208,16 @@ services:
       JAVA_TOOL_OPTIONS: >-
         -Xmx${HEAP_AUTH:-120m}
         -XX:+UseSerialGC -XX:TieredStopAtLevel=1
-        -XX:MaxMetaspaceSize=96m -XX:ReservedCodeCacheSize=32m
+        -XX:MaxMetaspaceSize=${META_LIMIT:-256m} -XX:ReservedCodeCacheSize=32m
         -Xss512k -XX:+ExitOnOutOfMemoryError
       MALLOC_ARENA_MAX: "2"
     volumes:
       - internal-tls:/etc/drenix/tls:ro
     networks: [drenix-internal]
-    mem_limit: ${MEM_AUTH:-260m}
+    mem_limit: ${MEM_AUTH:-240m}
+    cpus: ${CPU_AUTH:-0.30}
     depends_on:
-      redis: { condition: service_healthy }
-      user-service: { condition: service_started }
+      user-service: { condition: service_healthy }
       tls-init: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9092"]
@@ -313,7 +254,7 @@ services:
       JAVA_TOOL_OPTIONS: >-
         -Xmx${HEAP_PERFORMANCE:-200m}
         -XX:+UseSerialGC -XX:TieredStopAtLevel=1
-        -XX:MaxMetaspaceSize=96m -XX:ReservedCodeCacheSize=32m
+        -XX:MaxMetaspaceSize=${META_LIMIT:-256m} -XX:ReservedCodeCacheSize=32m
         -Xss512k -XX:+ExitOnOutOfMemoryError
       MALLOC_ARENA_MAX: "2"
       DB_POOL_SIZE: ${DB_POOL_SIZE:-4}
@@ -321,9 +262,9 @@ services:
       - internal-tls:/etc/drenix/tls:ro
     networks: [drenix-internal]
     mem_limit: ${MEM_PERFORMANCE:-380m}
+    cpus: ${CPU_PERFORMANCE:-0.50}
     depends_on:
-      postgres-identity: { condition: service_healthy }
-      user-service: { condition: service_started }
+      user-service: { condition: service_healthy }
       tls-init: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9095 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200'"]
@@ -344,20 +285,20 @@ services:
       TLS_CA_PATH: /etc/drenix/tls/internal-ca.crt
       # Polls one page of the audit log a minute and writes rows. Nothing here is large.
       JAVA_TOOL_OPTIONS: >-
-        -Xmx${HEAP_NOTIFICATION:-120m}
+        -Xmx${HEAP_NOTIFICATION:-130m}
         -XX:+UseSerialGC -XX:TieredStopAtLevel=1
-        -XX:MaxMetaspaceSize=96m -XX:ReservedCodeCacheSize=32m
+        -XX:MaxMetaspaceSize=${META_LIMIT:-256m} -XX:ReservedCodeCacheSize=32m
         -Xss512k -XX:+ExitOnOutOfMemoryError
       MALLOC_ARENA_MAX: "2"
       DB_POOL_SIZE: ${DB_POOL_SIZE:-4}
     volumes:
       - internal-tls:/etc/drenix/tls:ro
     networks: [drenix-internal]
-    mem_limit: ${MEM_NOTIFICATION:-260m}
+    mem_limit: ${MEM_NOTIFICATION:-320m}
+    cpus: ${CPU_NOTIFICATION:-0.30}
     depends_on:
-      postgres-identity: { condition: service_healthy }
-      user-service: { condition: service_started }
-      performance-service: { condition: service_started }
+      user-service: { condition: service_healthy }
+      performance-service: { condition: service_healthy }
       tls-init: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9097 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200'"]
@@ -394,17 +335,18 @@ services:
       JAVA_TOOL_OPTIONS: >-
         -Xmx${HEAP_GATEWAY:-180m}
         -XX:+UseSerialGC -XX:TieredStopAtLevel=1
-        -XX:MaxMetaspaceSize=96m -XX:ReservedCodeCacheSize=32m
+        -XX:MaxMetaspaceSize=${META_LIMIT:-256m} -XX:ReservedCodeCacheSize=32m
         -Xss512k -XX:+ExitOnOutOfMemoryError
       MALLOC_ARENA_MAX: "2"
     volumes:
       - internal-tls:/etc/drenix/tls:ro
     networks: [drenix-internal, dokploy-network]
-    mem_limit: ${MEM_GATEWAY:-340m}
+    mem_limit: ${MEM_GATEWAY:-320m}
+    cpus: ${CPU_GATEWAY:-0.50}
     depends_on:
-      auth-service: { condition: service_started }
-      performance-service: { condition: service_started }
-      notification-service: { condition: service_started }
+      auth-service: { condition: service_healthy }
+      performance-service: { condition: service_healthy }
+      notification-service: { condition: service_healthy }
       tls-init: { condition: service_completed_successfully }
     expose: ["8443"]
     healthcheck:
