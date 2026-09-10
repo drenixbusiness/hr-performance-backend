@@ -131,8 +131,14 @@ Dokploy panelida:
 2. **Provider: GitHub** → repozitoriyani ulang → branch **`main`**
 3. **Compose Path:**
    ```
-   deploy/docker-compose.dokploy.yml
+   ./deploy/docker-compose.registry.yml
    ```
+   `./` prefiksi bilan. `registry` — bu tayyor image'larni GHCR'dan tortadi, serverda build qilmaydi.
+   Serveringizda 2 GiB RAM bor va beshta Java modulini kompilyatsiya qilish uni cho'ktiradi —
+   sabablari `OPTIMIZATSIYA.md` da.
+
+   > `docker-compose.dokploy.yml` ham bor, u serverda build qiladi. Kuchli serverda ishlaydi;
+   > sizniki uchun emas.
 4. **Auto Deploy: OFF** ← muhim. Yoqiq qolsa, Dokploy build o'tgan-o'tmaganiga qaramay har
    push'da deploy qiladi va GitHub Actions'dagi tekshiruv ma'nosiz bo'ladi.
 
@@ -199,10 +205,19 @@ birinchi deploy'da o'zi yaratadi.
 
 ## 7. Birinchi deploy
 
-Dokploy'da **Deploy** tugmasini bosing va **deployment log**ini oching.
+**Avval GitHub Actions image'larni yaratishi kerak.** `main`ga push qilganingizda
+`.github/workflows/build-images.yml` beshta image'ni yig'ib GHCR'ga yuboradi. GitHub'da
+**Actions** tabidan yashil belgini kuting — birinchi safar 10–15 daqiqa (keyingilari cache
+tufayli tezroq).
 
-Birinchi build uzoq: beshta Java moduli manbadan kompilyatsiya qilinadi — **5–15 daqiqa**.
-Sabr qiling, log'ni kuzating.
+**GHCR paketlarini ko'rinadigan qiling.** Birinchi push'dan keyin GitHub'da
+`Your profile → Packages` da beshta paket paydo bo'ladi. Har biri uchun:
+**Package settings → Danger Zone → Change visibility → Public**.
+
+Aks holda Dokploy ularni torta olmaydi va `denied` xatosi beradi. (Yoki private qoldirib,
+serverda `docker login ghcr.io` qilish kerak — ochiq qilish osonroq, image'da maxfiy narsa yo'q.)
+
+Keyin Dokploy'da **Deploy** bosing. Bu safar server faqat **pull** qiladi — **1–2 daqiqa**.
 
 **Tekshirish:**
 
@@ -308,6 +323,8 @@ qoidasi API so'rovlarini o'g'irlab ketmaydi.
 - [ ] Dokploy Compose app, Auto Deploy **o'chiq**
 - [ ] 22 ta environment o'zgaruvchi
 - [ ] Domain: path `/api`, port `8443`, Strip Path **o'chiq**
+- [ ] GitHub Actions yashil, GHCR paketlari **public**
+- [ ] `docker stats` da har bir JVM limitining 80% dan pastda
 - [ ] `/api/health` → `{"status":"UP"}`
 - [ ] Admin paroli almashtirildi
 - [ ] `BOOTSTRAP_ADMIN_PASSWORD` o'chirildi

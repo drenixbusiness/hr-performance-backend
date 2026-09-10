@@ -1,7 +1,18 @@
-# Dokploy deployment.
+# Dokploy deployment, pulling pre-built images. THIS IS THE ONE TO USE.
 #
-# Paste the path `deploy/docker-compose.dokploy.yml` into a Dokploy application of type
-# **Compose**, pointed at this repository. Dokploy clones, builds and runs it.
+# Compose path in Dokploy:  ./deploy/docker-compose.registry.yml
+#
+# Identical to docker-compose.dokploy.yml except that it pulls the five service images from GHCR
+# instead of compiling them here. GitHub Actions builds and pushes them on every push to main
+# (.github/workflows/build-images.yml), then calls the Dokploy webhook.
+#
+# WHY. Compiling five Java modules needs about a gigabyte for Maven alone. On this server — 4 CPUs
+# and 2 GB shared with Dokploy and the running application — that build pinned the CPU at 92% and
+# filled swap. The build is not part of serving traffic; it does not belong on the machine that
+# serves it. Here the server only pulls, which is a minute instead of fifteen.
+#
+# GENERATED FROM docker-compose.dokploy.yml. If you change one, change both — CI validates both,
+# so a divergence that breaks either will fail the build rather than the deployment.
 #
 # THIS FILE REPLACES docker-compose.prod.yml — do not use both. The production overlay publishes
 # the gateway on 127.0.0.1:8443 for a host nginx to proxy; under Dokploy there is no host nginx,
@@ -211,11 +222,7 @@ services:
 
   user-service:
     <<: *prod
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        MODULE: user-service
+    image: ${IMAGE_PREFIX:-ghcr.io/drenixbusiness/hr-performance-backend}/user-service:${IMAGE_TAG:-main}
     environment:
       DB_URL: jdbc:postgresql://postgres-identity:5432/drenix_identity
       DB_USER: identity_app
@@ -247,11 +254,7 @@ services:
 
   auth-service:
     <<: *prod
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        MODULE: auth-service
+    image: ${IMAGE_PREFIX:-ghcr.io/drenixbusiness/hr-performance-backend}/auth-service:${IMAGE_TAG:-main}
     environment:
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD}
@@ -281,11 +284,7 @@ services:
 
   performance-service:
     <<: *prod
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        MODULE: performance-service
+    image: ${IMAGE_PREFIX:-ghcr.io/drenixbusiness/hr-performance-backend}/performance-service:${IMAGE_TAG:-main}
     environment:
       DB_URL: jdbc:postgresql://postgres-identity:5432/drenix_performance
       DB_USER: performance_app
@@ -332,11 +331,7 @@ services:
 
   notification-service:
     <<: *prod
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        MODULE: notification-service
+    image: ${IMAGE_PREFIX:-ghcr.io/drenixbusiness/hr-performance-backend}/notification-service:${IMAGE_TAG:-main}
     environment:
       DB_URL: jdbc:postgresql://postgres-identity:5432/drenix_notification
       DB_USER: notification_app
@@ -375,11 +370,7 @@ services:
   # ---------------------------------------------------------------------------
   edge-gateway:
     <<: *prod
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        MODULE: edge-gateway
+    image: ${IMAGE_PREFIX:-ghcr.io/drenixbusiness/hr-performance-backend}/edge-gateway:${IMAGE_TAG:-main}
     environment:
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD}

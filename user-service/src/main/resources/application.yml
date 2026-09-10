@@ -9,7 +9,15 @@ spring:
     username: ${DB_USER:identity_app}
     password: ${DB_PASSWORD}          # no default: refuse to start without it
     hikari:
-      maximum-pool-size: 16
+      # Every pooled connection is a Postgres backend process holding its own work_mem. Sixteen
+      # here plus ten in each of the other two services was 36 backends for a system serving ten
+      # people — hundreds of megabytes of Postgres for connections that sit idle. Four is more
+      # than this service needs; DB_POOL_SIZE raises it without a release if that turns out wrong.
+      maximum-pool-size: ${DB_POOL_SIZE:16}
+      minimum-idle: 1
+      # Hand an idle connection back rather than holding it open all night.
+      idle-timeout: 60000
+      max-lifetime: 900000
       leak-detection-threshold: 20000
   jpa:
     open-in-view: false               # keeps lazy loading out of the gRPC response path
